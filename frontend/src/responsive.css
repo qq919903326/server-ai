@@ -1,0 +1,33 @@
+/* Keep the welcome prompt within the scrollable message pane. */
+@media (min-height: 950px) {
+  .welcome {
+    margin-top: 0;
+  }
+  .welcome-icon { margin-bottom: 16px; }
+  .suggestions { margin: 20px 0 16px; }
+}
+@media (max-height: 820px) and (min-width: 761px) {
+  .welcome {
+    margin-top: 5px;
+  }
+  .welcome-icon {
+    width: 44px;
+    height: 44px;
+    margin-bottom: 14px;
+    font-size: 23px;
+  }
+  .welcome h2 {
+    margin: 10px 0;
+    font-size: 24px;
+  }
+  .welcome p {
+    line-height: 1.6;
+  }
+  .suggestions {
+    margin: 18px 0 16px;
+    gap: 6px;
+  }
+  .suggestions button {
+    padding: 9px 13px;
+  }
+}
