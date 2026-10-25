@@ -9,9 +9,12 @@ FROM python:3.13-slim
 WORKDIR /app
 COPY requirements.txt ./
 COPY database_mcp/requirements.txt database_mcp/requirements.txt
+COPY file_mcp/requirements.txt file_mcp/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 COPY backend/ backend/
 COPY database_mcp/ database_mcp/
+COPY file_mcp/ file_mcp/
+COPY assistant_dist/ assistant_dist/
 COPY --from=ui /build/dist frontend/dist/
 ENV AI_DATA_DIR=/app/data
 EXPOSE 8000

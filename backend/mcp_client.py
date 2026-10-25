@@ -51,8 +51,26 @@ class ToolHub:
                 cfg = self.store.get('mcp', id)
                 if not cfg or not cfg['enabled']:
                     raise ValueError('MCP 不存在或未启用：' + id)
-                session = await connect(self.stack, cfg)
-                for tool in await list_tools(session):
+                if cfg.get('service_type')=='project':
+                    from .project_tools import ProjectSession
+                    session=ProjectSession(self.store.projects_service,cfg['project_id'])
+                    available=await session.tools()
+                elif cfg.get('service_type') == 'database':
+                    from .database_tools import DatabaseSession
+                    session = DatabaseSession(cfg)
+                    available = await session.tools()
+                elif cfg.get('service_type') == 'jenkins':
+                    from .jenkins_tools import JenkinsSession
+                    session = JenkinsSession(cfg)
+                    available = await session.tools()
+                elif cfg.get('service_type') == 'ssh':
+                    from .ssh_tools import SSHSession
+                    session = SSHSession(cfg, self.store.root)
+                    available = await session.tools()
+                else:
+                    session = await connect(self.stack, cfg)
+                    available=await list_tools(session)
+                for tool in available:
                     if tool.name not in cfg.get('allowed_tools', []):
                         continue
                     alias = 'mcp_' + hashlib.sha256(f'{id}:{tool.name}'.encode()).hexdigest()[:24]
@@ -79,11 +97,38 @@ class ToolHub:
             raise ValueError('MCP 工具执行失败，请检查工具参数及服务状态。')
         return result.model_dump_json()
 
+    def timeout_for(self, alias, args):
+        route = self.routes.get(alias)
+        if route:
+            from .ssh_tools import SSHSession
+            if isinstance(route[0], SSHSession):
+                seconds = args.get('timeout', 60) if route[1] == 'exec' else 30
+                return min(300, max(1, seconds)) + 60 if isinstance(seconds, int) else 90
+        return 45
+
 
 async def discover(store, id):
     cfg = store.get('mcp', id)
     if not cfg:
         raise ValueError('找不到 MCP 配置')
+    if cfg.get('service_type')=='project':
+        from .project_tools import ProjectSession
+        return [tool.model_dump() for tool in await ProjectSession(store.projects_service,cfg['project_id']).tools()]
+    if cfg.get('service_type') == 'database':
+        from .database_tools import DatabaseSession
+        session = DatabaseSession(cfg)
+        await session.test()
+        return [tool.model_dump() for tool in await session.tools()]
+    if cfg.get('service_type') == 'jenkins':
+        from .jenkins_tools import JenkinsSession
+        session = JenkinsSession(cfg)
+        await session.test()
+        return [tool.model_dump() for tool in await session.tools()]
+    if cfg.get('service_type') == 'ssh':
+        from .ssh_tools import SSHSession
+        session = SSHSession(cfg, store.root)
+        await session.test()
+        return [tool.model_dump() for tool in await session.tools()]
     async with AsyncExitStack() as stack:
         session = await connect(stack, cfg)
         return [tool.model_dump() for tool in await list_tools(session)]

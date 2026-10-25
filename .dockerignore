@@ -8,3 +8,15 @@ work
 .git
 __pycache__
 tests
+**/agent.env
+**/agent.local.json
+**/connection.local.json
+**/project-roots.local.json
+**/__pycache__
+api.json
+turn
+p2p-release-*
+uuid-fix-*
+backup-*
+server-ai-*.tar.gz
+build*.log

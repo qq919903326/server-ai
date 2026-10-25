@@ -2,6 +2,7 @@ import json
 import os
 import asyncio
 from openai import AsyncOpenAI, APIError
+from .tool_errors import ToolExecutionError
 
 
 async def completion(config, messages, tools):
@@ -59,7 +60,7 @@ async def completion_stream(config, messages, tools):
         raise ValueError(f'模型服务请求失败（HTTP {status or "网络异常"}），请检查密钥、模型名称和服务地址。') from None
 
 
-async def agent_events(messages, tools, model_call, tool_call, max_rounds=8, model_stream=None):
+async def agent_events(messages, tools, model_call, tool_call, max_rounds=8, model_stream=None, tool_timeout=None):
     for round in range(max_rounds):
         yield 'status', {'text': f'正在思考 · 第 {round + 1} 轮'}
         if model_stream:
@@ -91,7 +92,10 @@ async def agent_events(messages, tools, model_call, tool_call, max_rounds=8, mod
                 args = json.loads(call['function']['arguments'])
                 if not isinstance(args, dict):
                     raise ValueError('工具参数必须为对象')
-                output = await asyncio.wait_for(tool_call(name, args), timeout=45)
+                timeout = tool_timeout(name, args) if tool_timeout else 45
+                output = await asyncio.wait_for(tool_call(name, args), timeout=timeout)
+            except ToolExecutionError as error:
+                output = json.dumps({'error': str(error), 'code': error.code}, ensure_ascii=False)
             except Exception:
                 output = json.dumps({'error': '工具调用失败，请检查参数、工具权限及连接状态。'}, ensure_ascii=False)
             content = str(output)[:30_000]

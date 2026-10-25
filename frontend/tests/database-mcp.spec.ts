@@ -15,13 +15,14 @@ test("database MCP templates can be configured and selected in chat", async ({
     await expect(drawer.getByLabel("名称", { exact: true })).toHaveValue(
       "MySQL",
     );
-    await expect(drawer.getByLabel("认证 Token 的环境变量名")).toHaveValue(
-      "MYSQL_MCP_TOKEN",
-    );
+    await expect(drawer.getByLabel("认证 Token 的环境变量名")).toHaveCount(0);
+    await expect(drawer.getByLabel("远程 MCP URL", { exact: true })).toHaveCount(0);
     await expect(drawer.getByLabel("启用", { exact: true })).toBeChecked();
     await drawer
-      .getByLabel("远程 MCP URL", { exact: true })
-      .fill("https://mysql-mcp.example/mcp");
+      .getByLabel("数据库 URL", { exact: true })
+      .fill("mysql://db.example:3306/app");
+    await drawer.getByLabel("账号", { exact: true }).fill("reader");
+    await drawer.getByLabel("密码", { exact: true }).fill("database-test-password");
     await drawer.getByRole("button", { name: "保存配置" }).click();
     await expect(
       page.getByRole("heading", { name: "MySQL", exact: true }),
@@ -32,9 +33,7 @@ test("database MCP templates can be configured and selected in chat", async ({
     await expect(
       page.getByRole("dialog").getByLabel("名称", { exact: true }),
     ).toHaveValue("PostgreSQL");
-    await expect(
-      page.getByRole("dialog").getByLabel("认证 Token 的环境变量名"),
-    ).toHaveValue("POSTGRES_MCP_TOKEN");
+    await expect(drawer.getByLabel("数据库 URL", { exact: true })).toHaveAttribute("placeholder", "postgresql://127.0.0.1:5432/my_database");
     await page
       .getByRole("dialog")
       .getByRole("button", { name: "关闭", exact: true })
@@ -52,6 +51,9 @@ test("database MCP templates can be configured and selected in chat", async ({
       "query",
     ]);
     expect(config.enabled).toBe(true);
+    expect(config.service_type).toBe("database");
+    expect(config.has_password).toBe(true);
+    expect(config.password).toBeUndefined();
   } finally {
     await request.delete("/api/mcp/" + id);
   }

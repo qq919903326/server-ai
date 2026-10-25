@@ -8,3 +8,11 @@ __pycache__/
 work/
 frontend/test-results/
 frontend/playwright-report/
+file_mcp/agent.env
+file_mcp/agent.local.json
+connection.local.json
+project-roots.local.json
+api.json
+assistant_dist/*
+!assistant_dist/.gitkeep
+turn/

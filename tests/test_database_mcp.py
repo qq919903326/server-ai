@@ -4,6 +4,22 @@ from datetime import datetime
 import pytest
 
 
+@pytest.mark.parametrize('engine,url,port', [
+    ('mysql', 'db.example/app', 3306),
+    ('mysql', 'mysql://[::1]:3307/app', 3307),
+    ('postgres', 'db.example:5433/app', 5433),
+    ('postgres', 'pgsql://db.example/app', 5432),
+])
+def test_direct_database_urls(engine, url, port):
+    from backend.database_tools import database_config
+    config = database_config({'database_engine': engine, 'url': url,
+        'username': 'reader', 'password': 'p@ss:/?#word'})
+    assert config.engine == engine
+    assert config.port == port
+    assert config.database == 'app'
+    assert config.password == 'p@ss:/?#word'
+
+
 def test_database_sql_rejects_writes_and_multiple_statements():
     from database_mcp.database import prepare_query
     for engine in ('mysql', 'postgres'):

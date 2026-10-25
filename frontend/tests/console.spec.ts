@@ -68,10 +68,8 @@ test("console navigation, skill persistence, workflow execution and history", as
     await card.getByRole("button", { name: "运行流程" }).click();
     await page.getByPlaceholder("输入流程需要处理的内容").fill("测试任务");
     await page.getByRole("button", { name: "开始执行" }).click();
-    await expect(
-      page.getByText("执行完成：测试任务", { exact: true }),
-    ).toBeVisible();
-    await page.getByRole("button", { name: "关闭", exact: true }).click();
+    await expect(page.getByTestId('workflow-output')).toHaveText('执行完成：测试任务');
+    await page.getByRole("button", { name: "关闭运行视图", exact: true }).click();
     await page.getByRole("menuitem", { name: "运行记录" }).click();
     await expect(
       page.getByRole("cell", { name: "浏览器验证流程", exact: true }),

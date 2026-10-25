@@ -4,13 +4,11 @@ from uuid import uuid4
 from .agent import completion, agent_events
 from .mcp_client import ToolHub
 from .store import now
+from .model_catalog import resolve_model_config
 
 
 def model_config(store, id):
-    cfg = store.get('models', id)
-    if not cfg or not cfg['enabled']:
-        raise ValueError('模型不存在或未启用')
-    return cfg
+    return resolve_model_config(store,id)
 
 
 def skill_prompt(store, ids):
@@ -23,13 +21,18 @@ def skill_prompt(store, ids):
     return '\n'.join(parts)
 
 
-async def run_agent(store, model_id, text, skill_ids, mcp_ids):
+async def run_agent(store, model_id, text, skill_ids, mcp_ids, on_event=None):
     cfg = model_config(store, model_id)
     messages = [{'role': 'system', 'content': skill_prompt(store, skill_ids)}, {'role': 'user', 'content': text}]
     async with ToolHub(store, mcp_ids) as hub:
         async def model(messages, tools):
             return await completion(cfg, messages, tools)
-        async for event, data in agent_events(messages, hub.tools, model, hub.call):
+        async for event, data in agent_events(messages, hub.tools, model, hub.call, tool_timeout=hub.timeout_for):
+            if on_event:
+                if event.startswith('tool_') and data.get('name') in hub.routes:
+                    route = hub.routes[data['name']]
+                    data = {**data, 'tool_name': route[1], 'server_id': route[3]}
+                on_event(event, data)
             if event == 'answer':
                 return data['text']
 
@@ -41,19 +44,28 @@ def render(template, input, previous, outputs):
     return text
 
 
-async def execute_workflow(store, workflow, request):
+async def execute_workflow(store, workflow, request, on_update=None):
     id = uuid4().hex
-    record = {'kind': 'workflow', 'name': workflow['name'], 'status': 'running', 'started_at': now(), 'trace': [], 'output': ''}
-    store.put('runs', id, record)
+    record = {'kind': 'workflow', 'name': workflow['name'], 'workflow_id': workflow.get('id'),
+        'workflow_snapshot': workflow, 'current_step': None, 'status': 'running', 'started_at': now(), 'trace': [], 'output': ''}
+    def persist():
+        saved = store.put('runs', id, record)
+        if on_update:
+            on_update(saved)
+    persist()
     steps = {s['id']: s for s in workflow['steps']}
-    current, previous, outputs = workflow['steps'][0]['id'], request.input, {}
+    current, previous, outputs = workflow.get('entry_id') or workflow['steps'][0]['id'], request.input, {}
     try:
         async with asyncio.timeout(600):
             for _ in range(40):
                 step = steps[current]
-                entry = {'step': current, 'type': step['type'], 'started_at': now()}
+                entry = {'step': current, 'type': step['type'], 'status': 'running', 'started_at': now(), 'events': []}
+                record['current_step'] = current
+                record['trace'].append(entry)
+                persist()
                 next_id = step.get('next')
                 for attempt in range(step.get('retries', 0) + 1):
+                    entry['attempts'] = attempt + 1
                     try:
                         if step['type'] == 'condition':
                             matched = step['contains'] in previous
@@ -63,8 +75,11 @@ async def execute_workflow(store, workflow, request):
                         elif step['type'] == 'template':
                             output = render(step['prompt'], request.input, previous, outputs)
                         elif step['type'] == 'prompt':
+                            def on_event(event, data):
+                                entry['events'].append({'event': event, **data})
+                                persist()
                             output = await run_agent(store, step['model_id'] or request.model_id,
-                                render(step['prompt'], request.input, previous, outputs), step['skill_ids'], step['mcp_ids'])
+                                render(step['prompt'], request.input, previous, outputs), step['skill_ids'], step['mcp_ids'], on_event)
                         else:
                             async with ToolHub(store, [step['server_id']]) as hub:
                                 alias = next((a for a, route in hub.routes.items() if route[1] == step['tool_name']), None)
@@ -83,14 +98,15 @@ async def execute_workflow(store, workflow, request):
                     except Exception:
                         if attempt == step.get('retries', 0):
                             entry['status'] = 'failed'
-                            record['trace'].append(entry)
+                            entry['finished_at'] = now()
                             raise
+                        entry['retrying'] = True
+                        persist()
                         await asyncio.sleep(min(attempt + 1, 3))
                 previous = outputs[current] = output
-                entry.update(status='completed', output=output, attempts=attempt + 1)
-                record['trace'].append(entry)
+                entry.update(status='completed', output=output, attempts=attempt + 1, next_step=next_id, finished_at=now(), retrying=False)
                 record['output'] = output
-                store.put('runs', id, record)
+                persist()
                 if not next_id:
                     break
                 current = next_id
@@ -103,6 +119,10 @@ async def execute_workflow(store, workflow, request):
     except Exception as exc:
         record.update(status='failed', error=str(exc) if isinstance(exc, ValueError) else '流程执行失败，请检查模型和工具连接配置。')
     finally:
+        for entry in record['trace']:
+            if entry['status'] == 'running':
+                entry.update(status='cancelled' if record['status']=='cancelled' else 'failed', finished_at=now())
+        record['current_step'] = None
         record['finished_at'] = now()
-        store.put('runs', id, record)
+        persist()
     return store.get('runs', id)

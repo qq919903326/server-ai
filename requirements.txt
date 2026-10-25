@@ -7,4 +7,6 @@ jsonschema>=4.23,<5
 pytest>=8,<10
 httpx>=0.28,<1
 httpx2>=2.16,<3
+paramiko>=3.5,<5
 -r database_mcp/requirements.txt
+-r file_mcp/requirements.txt

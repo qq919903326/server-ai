@@ -1,5 +1,7 @@
 # MySQL / PostgreSQL 远程 HTTP MCP
 
+AI Studio 内使用数据库时，在「MCP 工具」点击「连接 MySQL」或「连接 PostgreSQL」，填写数据库 URL、账号和密码即可。无需启动本目录的 HTTP MCP 服务、配置 MCP URL 或 Token；保存后自动提供三个只读工具，测试连接会执行 `SELECT 1`。下面的独立部署步骤供其他远程 MCP 客户端接入使用。在 AI Studio 接入独立 HTTP 服务时，请使用「新建连接」。
+
 两个可独立部署的 MCP 服务，使用项目现有的 MCP Python SDK 1.x，通过 Streamable HTTP 提供工具。不读取开发环境 tools、不发现本机 MCP、不提供 stdio 或本地命令执行。
 
 | 服务 | 默认端口 | MCP 路径 |
@@ -76,7 +78,7 @@ MYSQL_MCP_TOKEN=与MySQL服务端一致的令牌
 POSTGRES_MCP_TOKEN=与PostgreSQL服务端一致的令牌
 ```
 
-重启 AI Studio，在「MCP 工具」中点击「连接 MySQL」「连接 PostgreSQL」，模板会预填名称、Token 环境变量名及工具白名单。填写远程地址并保存：
+重启 AI Studio，在「MCP 工具」中点击「新建连接」，配置名称、Token 环境变量名、工具白名单及远程地址并保存：
 
 | 配置项 | MySQL | PostgreSQL |
 | --- | --- | --- |

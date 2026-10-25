@@ -46,12 +46,32 @@ import {
 } from "@ant-design/icons";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { ModelFields } from "./models/ModelFields";
+import { Projects } from "./Projects";
+import { browserProjects } from "./projects/browser";
+import {
+  saveLocalSession,
+  saveLocalRun,
+  localRecords,
+  localSession,
+  activeLocalSession,
+  clearActiveLocalSession,
+  mergeRecords,
+  migrateServerHistory,
+} from "./chat/history";
+import { modelOptions } from "./models/options";
 import { api, streamChat } from "./api";
+import { uuid } from "./utils/id";
 import "./style.css";
 import "./responsive.css";
+import { WorkflowEditor } from "./workflow/WorkflowEditor";
+import { WorkflowRunView } from "./workflow/WorkflowRunView";
+import { WorkflowPreview } from "./workflow/WorkflowPreview";
+import type { Workflow, Run } from "./workflow/graph";
 
 type RecordData = { [key: string]: any };
 const titles: Record<string, [string, string]> = {
+  projects: ["本地文件库", "下载授权助手，在本机选择文件夹，网页自动连接"],
   chat: ["对话工作台", "让模型、技能与工具协同完成任务"],
   models: ["模型连接", "统一管理 DeepSeek、GPT、MiMo 和兼容服务"],
   mcp: ["MCP 工具", "连接外部能力，明确每项工具的执行权限"],
@@ -59,7 +79,7 @@ const titles: Record<string, [string, string]> = {
   workflows: ["Workflow 工作流", "用明确的步骤，组织可重复执行的任务"],
   runs: ["运行记录", "追踪每一次执行的结果与工具调用"],
 };
-const ids = () => crypto.randomUUID().replaceAll("-", "").slice(0, 12);
+const ids = () => uuid().replaceAll("-", "").slice(0, 12);
 function Markdown({ text }: { text: string }) {
   return <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>;
 }
@@ -93,6 +113,9 @@ function Console() {
   const [page, setPage] = useState("chat"),
     [loading, setLoading] = useState(false);
   const [connected, setConnected] = useState(false);
+  const [storeSessions, setStoreSessions] = useState(false),
+    [storageKnown, setStorageKnown] = useState(false),
+    [storageBusy, setStorageBusy] = useState(false);
   const [models, setModels] = useState<RecordData[]>([]),
     [mcps, setMcps] = useState<RecordData[]>([]),
     [skills, setSkills] = useState<RecordData[]>([]),
@@ -116,15 +139,19 @@ function Console() {
   const [detail, setDetail] = useState<RecordData | null>(null),
     [tokenOpen, setTokenOpen] = useState(false),
     [token, setToken] = useState(sessionStorage.getItem("ai-token") || "");
-  const [workflowRun, setWorkflowRun] = useState<RecordData | null>(null),
-    [workflowInput, setWorkflowInput] = useState(""),
-    [workflowBusy, setWorkflowBusy] = useState(false);
+  const [workflowRun, setWorkflowRun] = useState<RecordData | null>(null);
+  const [visualWorkflow, setVisualWorkflow] = useState<Workflow | null>(null);
+  const [runHistory, setRunHistory] = useState<Run | null>(null);
   const controller = useRef<AbortController | null>(null),
     bottom = useRef<HTMLDivElement>(null);
 
   async function refresh() {
     setLoading(true);
     try {
+      const storage = await api("/settings/session-storage");
+      setStoreSessions(storage.enabled);
+      setStorageKnown(true);
+      if (!storage.enabled) await migrateServerHistory();
       const data = await Promise.all(
         ["/models", "/mcp", "/skills", "/workflows", "/runs", "/sessions"].map(
           (p) => api(p),
@@ -143,8 +170,8 @@ function Console() {
       );
       setSkills(data[2]);
       setWorkflows(data[3]);
-      setRuns(data[4]);
-      setSessions(data[5]);
+      setRuns(mergeRecords(data[4], await localRecords("run")));
+      setSessions(mergeRecords(data[5], await localRecords("session")));
     } catch (e) {
       setConnected(false);
       message.error((e as Error).message);
@@ -154,13 +181,81 @@ function Console() {
   }
   useEffect(() => {
     void refresh();
+    let cancelled = false;
+    void activeLocalSession()
+      .then((saved) => {
+        if (saved && !cancelled) {
+          setSid(saved.id);
+          setMessages(saved.messages || []);
+          setTrace(saved.trace || []);
+        }
+      })
+      .catch((error) => message.error("无法读取本地会话：" + error.message));
+    browserProjects.start();
+    return () => {
+      cancelled = true;
+      browserProjects.stop();
+    };
   }, []);
   useEffect(() => {
     bottom.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, status]);
+  useEffect(() => {
+    if (!sid || !messages.length) return;
+    const row = {
+      id: sid,
+      title:
+        messages.find((m) => m.role === "user")?.content?.slice(0, 40) ||
+        "本地会话",
+      messages,
+      trace,
+    };
+    void saveLocalSession(row)
+      .then(() => localRecords("session"))
+      .then((rows) => setSessions((previous) => mergeRecords(previous, rows)))
+      .catch((error) => message.error("本地会话保存失败：" + error.message));
+  }, [sid, messages, trace]);
+  async function changeSessionStorage(enabled: boolean) {
+    setStorageBusy(true);
+    try {
+      await api("/settings/session-storage", "PUT", { enabled });
+      setStoreSessions(enabled);
+      await refresh();
+    } catch (error) {
+      message.error((error as Error).message);
+    } finally {
+      setStorageBusy(false);
+    }
+  }
+  const selectableModels = modelOptions(models);
+  const fileLibraryIds = new Set(
+    mcps.filter((m) => m.service_type === "project").map((m) => m.id),
+  );
   const configured = models.filter((m) => m.has_key).length;
 
   function edit(kind: string, data?: RecordData) {
+    if (kind === "mcp" && data?.service_type === "file_p2p") {
+      setPage("projects");
+      return;
+    }
+    if (kind === "workflows") {
+      setVisualWorkflow(
+        (data || {
+          id: ids(),
+          name: "新工作流",
+          description: "",
+          steps: [
+            {
+              id: "first",
+              label: "开始处理",
+              type: "prompt",
+              prompt: "请处理以下任务：\n{{input}}",
+            },
+          ],
+        }) as Workflow,
+      );
+      return;
+    }
     const defaults: Record<string, RecordData> = {
       models: {
         id: ids(),
@@ -187,23 +282,10 @@ function Console() {
         content: "# 技能说明\n\n描述任务目标、执行步骤与输出要求。",
         enabled: true,
       },
-      workflows: {
-        id: ids(),
-        name: "",
-        description: "",
-        steps: [
-          {
-            id: "first",
-            type: "prompt",
-            prompt: "请处理以下任务：\n{{input}}",
-          },
-        ],
-      },
     };
     const value = { ...(data || defaults[kind]) };
     if (kind === "models") value.api_key = "";
-    if (kind === "workflows")
-      value.steps_json = JSON.stringify(value.steps, null, 2);
+    if (kind === "mcp") value.password = "";
     setEditor({ kind, data: value });
     form.resetFields();
     form.setFieldsValue(value);
@@ -213,9 +295,33 @@ function Console() {
       id: engine + "-" + ids(),
       name: engine === "mysql" ? "MySQL" : "PostgreSQL",
       transport: "http",
+      service_type: "database",
+      database_engine: engine,
       url: "",
-      token_env: engine === "mysql" ? "MYSQL_MCP_TOKEN" : "POSTGRES_MCP_TOKEN",
+      username: "",
+      password: "",
       allowed_tools: ["list_tables", "describe_table", "query"],
+      enabled: true,
+    });
+  }
+  function connectFiles() {
+    setPage("projects");
+  }
+  function connectSSH() {
+    edit("mcp", {
+      id: "ssh-" + ids(), name: "SSH 服务器", service_type: "ssh",
+      host: "", port: 22, username: "", password: "",
+      allowed_tools: ["exec", "list_directory", "read_file", "write_file"],
+      enabled: true,
+    });
+  }
+  function connectJenkins() {
+    edit("mcp", {
+      id: "jenkins-" + ids(), name: "Jenkins", service_type: "jenkins",
+      url: "", username: "", password: "",
+      allowed_tools: ["server_info", "list_jobs", "job_info", "build_info", "build_log",
+        "queue_info", "trigger_build", "stop_build", "set_job_enabled",
+        "get_job_config", "update_job_config", "create_job"],
       enabled: true,
     });
   }
@@ -223,7 +329,6 @@ function Console() {
     if (!editor) return;
     try {
       const data = await form.validateFields();
-      if (editor.kind === "workflows") data.steps = JSON.parse(data.steps_json);
       await api(`/${editor.kind}/${editor.data.id}`, "PUT", {
         ...editor.data,
         ...data,
@@ -257,6 +362,22 @@ function Console() {
   }
   async function send(value = input) {
     if (!value.trim() || busy) return;
+    if (!storageKnown) {
+      message.error("请先连接服务器并确认会话存储设置");
+      return;
+    }
+    let activeId: string, runId: string;
+    try {
+      activeId = sid || ids();
+      runId = ids();
+    } catch (error) {
+      message.error((error as Error).message);
+      return;
+    }
+    const startedAt = new Date().toISOString();
+    let finishedRun: RecordData | undefined,
+      runStatus = "completed";
+    setSid(activeId);
     setInput("");
     setBusy(true);
     setTrace([]);
@@ -269,13 +390,21 @@ function Console() {
         {
           model_id: model,
           message: value,
-          session_id: sid,
+          session_id: activeId,
+          history: messages
+            .filter((m) => m.role === "user" || m.role === "assistant")
+            .map((m) => ({ role: m.role, content: m.content })),
+          store_session: storeSessions,
           skill_ids: selectedSkills,
           mcp_ids: selectedMCP,
         },
         controller.current.signal,
         (event, data) => {
-          if (event === "session") setSid(data.session_id);
+          if (event === "session") runId = data.run_id || runId;
+          if (event === "done") {
+            finishedRun = data.run;
+            runStatus = data.status || runStatus;
+          }
           if (event === "status") setStatus(data.text);
           if (event === "tool_start" || event === "tool_end") {
             setTrace((prev) => [...prev, { event, ...data }]);
@@ -310,6 +439,7 @@ function Console() {
             );
           }
           if (event === "error") {
+            runStatus = "failed";
             message.error(data.message);
             setMessages((prev) => [
               ...prev,
@@ -319,9 +449,28 @@ function Console() {
         },
       );
     } catch (e) {
+      runStatus = (e as Error).name === "AbortError" ? "cancelled" : "failed";
       if ((e as Error).name !== "AbortError")
         message.error((e as Error).message);
     } finally {
+      try {
+        await saveLocalRun(
+          (finishedRun || {
+            id: runId,
+            kind: "chat",
+            name: value.slice(0, 40),
+            session_id: activeId,
+            model_id: model,
+            started_at: startedAt,
+            finished_at: new Date().toISOString(),
+            status: runStatus,
+          }) as any,
+        );
+      } catch (error) {
+        message.error(
+          "聊天运行记录保存到本地失败：" + (error as Error).message,
+        );
+      }
       setBusy(false);
       setStatus("");
       controller.current = null;
@@ -331,36 +480,21 @@ function Console() {
   async function openSession(item: RecordData) {
     if (busy) return;
     try {
-      const data = await api("/sessions/" + item.id);
+      const data =
+        (await localSession(item.id)) || (await api("/sessions/" + item.id));
       setSid(item.id);
       setMessages(data.messages);
-      setTrace([]);
+      setTrace(data.trace || []);
     } catch (e) {
       message.error((e as Error).message);
-    }
-  }
-  async function executeWorkflow() {
-    if (!workflowRun) return;
-    setWorkflowBusy(true);
-    try {
-      const result = await api(
-        "/workflows/" + workflowRun.id + "/run",
-        "POST",
-        { input: workflowInput, model_id: model },
-      );
-      setDetail(result);
-      setWorkflowRun(null);
-      await refresh();
-    } catch (e) {
-      message.error((e as Error).message);
-    } finally {
-      setWorkflowBusy(false);
     }
   }
   const actions = (kind: string, item: RecordData) => (
     <Space>
       <Tooltip title="编辑">
-        <Button icon={<EditOutlined />} onClick={() => edit(kind, item)} />
+        <Button icon={<EditOutlined />} onClick={() => edit(kind, item)}>
+          {kind === "workflows" ? "图形编辑" : null}
+        </Button>
       </Tooltip>
       <Popconfirm
         title="确认删除这条记录？"
@@ -398,6 +532,11 @@ function Console() {
             { key: "chat", icon: <MessageOutlined />, label: "对话工作台" },
             { key: "models", icon: <RobotOutlined />, label: "模型连接" },
             { key: "mcp", icon: <ApiOutlined />, label: "MCP 工具" },
+            {
+              key: "projects",
+              icon: <FileTextOutlined />,
+              label: "本地文件库",
+            },
             { key: "skills", icon: <AppstoreOutlined />, label: "Skills 技能" },
             {
               key: "workflows",
@@ -435,7 +574,7 @@ function Console() {
               <h1>{titles[page][0]}</h1>
               <p>{titles[page][1]}</p>
             </div>
-            {page !== "chat" && page !== "runs" && (
+            {page !== "chat" && page !== "runs" && page !== "projects" && (
               <Button
                 type="primary"
                 icon={<PlusOutlined />}
@@ -462,7 +601,7 @@ function Console() {
                       aria-label="选择模型"
                       value={model}
                       onChange={setModel}
-                      options={models
+                      options={selectableModels
                         .filter((m) => m.enabled)
                         .map((m) => ({ value: m.id, label: m.name }))}
                       style={{ width: 200 }}
@@ -475,6 +614,7 @@ function Console() {
                     onClick={() => {
                       setSid(undefined);
                       setMessages([]);
+                      void clearActiveLocalSession();
                       setTrace([]);
                     }}
                   >
@@ -590,6 +730,23 @@ function Console() {
                 <div className="context-title">
                   <SettingOutlined /> 本次对话配置
                 </div>
+                <Space style={{ marginBottom: 8 }}>
+                  <label>服务端存储会话</label>
+                  <Switch
+                    aria-label="服务端存储会话"
+                    checked={storeSessions}
+                    disabled={busy || !storageKnown}
+                    loading={storageBusy}
+                    onChange={(enabled) => void changeSessionStorage(enabled)}
+                  />
+                </Space>
+                <p className="helper">
+                  {!storageKnown
+                    ? "正在读取存储设置…"
+                    : storeSessions
+                      ? "已开启服务端副本；浏览器仍保留本地历史。"
+                      : "已关闭：会话与聊天运行记录只保存在当前浏览器。"}
+                </p>
                 <label>Skills 技能</label>
                 <Select
                   mode="multiple"
@@ -600,6 +757,34 @@ function Console() {
                     .filter((s) => s.enabled)
                     .map((s) => ({ value: s.id, label: s.name }))}
                 />
+                <label>本地文件库</label>
+                <Select
+                  aria-label="本地文件库"
+                  mode="multiple"
+                  placeholder="可选择多个本地文件库"
+                  notFoundContent="请先在本地文件库中添加并授权目录"
+                  value={selectedMCP.filter((id) => fileLibraryIds.has(id))}
+                  onChange={(ids) =>
+                    setSelectedMCP((prev) => [
+                      ...prev.filter((id) => !fileLibraryIds.has(id)),
+                      ...ids,
+                    ])
+                  }
+                  options={mcps
+                    .filter((m) => fileLibraryIds.has(m.id))
+                    .map((m) => ({
+                      value: m.id,
+                      label: m.name.replace(/^(项目|文件库) · /, ""),
+                      disabled: !m.enabled,
+                    }))}
+                />
+                <Button
+                  type="link"
+                  size="small"
+                  onClick={() => setPage("projects")}
+                >
+                  管理本地文件库
+                </Button>
                 <label>MCP 工具服务</label>
                 <Select
                   aria-label="MCP 工具服务"
@@ -608,19 +793,26 @@ function Console() {
                     mcps.length ? "选择工具服务" : "请先配置数据库或其他 MCP"
                   }
                   notFoundContent="尚未配置远程 MCP 服务"
-                  value={selectedMCP}
-                  onChange={setSelectedMCP}
-                  options={mcps.map((m) => ({
-                    value: m.id,
-                    label:
-                      m.name +
-                      (!m.enabled
-                        ? "（未启用）"
-                        : !m.allowed_tools?.length
-                          ? "（未授权工具）"
-                          : ""),
-                    disabled: !m.enabled || !m.allowed_tools?.length,
-                  }))}
+                  value={selectedMCP.filter((id) => !fileLibraryIds.has(id))}
+                  onChange={(ids) =>
+                    setSelectedMCP((prev) => [
+                      ...prev.filter((id) => fileLibraryIds.has(id)),
+                      ...ids,
+                    ])
+                  }
+                  options={mcps
+                    .filter((m) => !fileLibraryIds.has(m.id))
+                    .map((m) => ({
+                      value: m.id,
+                      label:
+                        m.name +
+                        (!m.enabled
+                          ? "（未启用）"
+                          : !m.allowed_tools?.length
+                            ? "（未授权工具）"
+                            : ""),
+                      disabled: !m.enabled || !m.allowed_tools?.length,
+                    }))}
                 />
                 <Button type="link" size="small" onClick={() => setPage("mcp")}>
                   配置数据库 MCP
@@ -643,7 +835,7 @@ function Console() {
                       </button>
                     ))
                   ) : (
-                    <p className="helper">开始对话后会自动保存</p>
+                    <p className="helper">开始对话后会自动保存到本地浏览器</p>
                   )}
                 </div>
                 {trace.length > 0 && (
@@ -735,6 +927,18 @@ function Console() {
                   </div>
                 </>
               )}
+              {page === "projects" && (
+                <Projects
+                  onChanged={() => void refresh()}
+                  onUse={(ids) => {
+                    setSelectedMCP((prev) =>
+                      Array.from(new Set([...prev, ...ids])),
+                    );
+                    setPage("chat");
+                    void refresh();
+                  }}
+                />
+              )}
               {page === "mcp" && (
                 <>
                   <Alert
@@ -742,12 +946,11 @@ function Console() {
                     type="info"
                     showIcon
                     message="每个连接独立授权工具"
-                    description="填写远程 MCP HTTP 地址，测试连接查看工具名称，再编辑白名单并启用。"
+                    description="Jenkins 填写地址或 IP:端口、账号和密码；SSH 填写 IP、端口、账号和密码；MySQL / PostgreSQL 填写数据库 URL、账号和密码。其他 MCP 服务填写远程 HTTP 地址。"
                   />
                   <div className="section-tools">
                     <span>
-                      数据库连接模板：填入已部署的远程 MCP
-                      服务地址，保存后即可在对话中选择。
+                      Jenkins、SSH 和数据库由服务器直接连接，保存后即可在对话和工作流中使用。本地文件需先运行代理并授权目录。
                     </span>
                     <Space wrap>
                       <Button onClick={() => connectDatabase("mysql")}>
@@ -756,11 +959,14 @@ function Console() {
                       <Button onClick={() => connectDatabase("postgres")}>
                         连接 PostgreSQL
                       </Button>
+                      <Button onClick={connectFiles}>本地文件库</Button>
+                      <Button onClick={connectSSH}>连接 SSH</Button>
+                      <Button onClick={connectJenkins}>连接 Jenkins</Button>
                     </Space>
                   </div>
                   {!mcps.length && (
                     <Card>
-                      <Empty description="尚未配置远程 MCP 服务">
+                      <Empty description="尚未配置数据库或 MCP 服务">
                         <Button type="primary" onClick={() => edit("mcp")}>
                           添加远程 MCP
                         </Button>
@@ -768,32 +974,34 @@ function Console() {
                     </Card>
                   )}
                   <div className="card-grid">
-                    {mcps.map((item) => (
-                      <Card key={item.id} className="resource-card">
-                        <div className="resource-heading">
-                          <div className="provider-icon mcp">
-                            <ApiOutlined />
+                    {mcps
+                      .filter((item) => item.service_type !== "project")
+                      .map((item) => (
+                        <Card key={item.id} className="resource-card">
+                          <div className="resource-heading">
+                            <div className="provider-icon mcp">
+                              <ApiOutlined />
+                            </div>
+                            <div>
+                              <h3>{item.name}</h3>
+                              <span>{item.service_type === "jenkins" ? "JENKINS · 直连" : item.service_type === "ssh" ? "SSH · 直连" : item.service_type === "database" ? `${item.database_engine === "mysql" ? "MYSQL" : "POSTGRESQL"} · 直连` : "REMOTE HTTP"}</span>
+                            </div>
+                            <Tag color={item.enabled ? "green" : "default"}>
+                              {item.enabled ? "已启用" : "未启用"}
+                            </Tag>
                           </div>
-                          <div>
-                            <h3>{item.name}</h3>
-                            <span>REMOTE HTTP</span>
+                          <div className="endpoint tall">{item.service_type === "ssh" ? `${item.username}@${item.host.includes(":") ? `[${item.host}]` : item.host}:${item.port}` : item.url}</div>
+                          <p className="helper">
+                            已授权 {item.allowed_tools?.length || 0} 个工具
+                          </p>
+                          <div className="card-actions">
+                            <Button onClick={() => void test("mcp", item)}>
+                              测试与发现工具
+                            </Button>
+                            {actions("mcp", item)}
                           </div>
-                          <Tag color={item.enabled ? "green" : "default"}>
-                            {item.enabled ? "已启用" : "未启用"}
-                          </Tag>
-                        </div>
-                        <div className="endpoint tall">{item.url}</div>
-                        <p className="helper">
-                          已授权 {item.allowed_tools?.length || 0} 个工具
-                        </p>
-                        <div className="card-actions">
-                          <Button onClick={() => void test("mcp", item)}>
-                            测试与发现工具
-                          </Button>
-                          {actions("mcp", item)}
-                        </div>
-                      </Card>
-                    ))}
+                        </Card>
+                      ))}
                   </div>
                 </>
               )}
@@ -863,8 +1071,8 @@ function Console() {
                     className="section-alert"
                     showIcon
                     type="info"
-                    message="配置式工作流"
-                    description="支持模型、模板、条件分支和 MCP 工具步骤，通过 next / otherwise 连接；每步可配置重试，执行记录自动保存。"
+                    message="可视化工作流"
+                    description="拖动节点、连接端口，配置模型和工具的调用关系。条件节点支持两条分支，运行时实时显示实际执行路径。"
                   />
                   <div className="card-grid">
                     {workflows.map((item) => (
@@ -881,21 +1089,13 @@ function Console() {
                         <p className="skill-description">
                           {item.description || "按配置执行任务"}
                         </p>
-                        <div className="flow-preview">
-                          {item.steps.map((s: RecordData, i: number) => (
-                            <React.Fragment key={s.id}>
-                              {i > 0 && <span>→</span>}
-                              <Tag>{s.id}</Tag>
-                            </React.Fragment>
-                          ))}
-                        </div>
+                        <WorkflowPreview workflow={item as Workflow} />
                         <div className="card-actions">
                           <Button
                             type="primary"
                             ghost
                             onClick={() => {
                               setWorkflowRun(item);
-                              setWorkflowInput("");
                             }}
                           >
                             运行流程
@@ -932,7 +1132,15 @@ function Console() {
                       {
                         title: "操作",
                         render: (_: unknown, r: RecordData) => (
-                          <Button onClick={() => setDetail(r)}>查看详情</Button>
+                          <Button
+                            onClick={() =>
+                              r.kind === "workflow" && r.workflow_snapshot
+                                ? setRunHistory(r as Run)
+                                : setDetail(r)
+                            }
+                          >
+                            查看详情
+                          </Button>
                         ),
                       },
                     ]}
@@ -993,62 +1201,77 @@ function Console() {
               <Input />
             </Form.Item>
             {editor.kind === "models" && (
-              <>
-                <Form.Item name="provider" label="服务商">
-                  <Select
-                    options={[
-                      { value: "deepseek", label: "DeepSeek" },
-                      { value: "openai", label: "OpenAI" },
-                      { value: "mimo", label: "小米 MiMo" },
-                      { value: "custom", label: "兼容接口" },
-                    ]}
-                  />
-                </Form.Item>
-                <Form.Item
-                  name="base_url"
-                  label="API 地址"
-                  rules={[{ required: true }]}
-                >
-                  <Input placeholder="https://api.deepseek.com" />
-                </Form.Item>
-                <Form.Item
-                  name="model"
-                  label="模型名称"
-                  rules={[{ required: true }]}
-                >
-                  <Input placeholder="填写账号可用的模型 ID" />
-                </Form.Item>
-                <Form.Item
-                  name="api_key"
-                  label="API Key"
-                  extra="留空保留已保存的密钥；也可以通过环境变量配置。"
-                >
-                  <Input.Password
-                    autoComplete="new-password"
-                    placeholder={
-                      editor.data.has_key ? "已配置，留空保留" : "输入 API Key"
-                    }
-                  />
-                </Form.Item>
-                <Form.Item name="key_env" label="密钥环境变量名">
-                  <Input placeholder="例如 DEEPSEEK_API_KEY" />
-                </Form.Item>
-                <Form.Item
-                  name="clear_key"
-                  label="清除已保存密钥"
-                  valuePropName="checked"
-                >
-                  <Switch />
-                </Form.Item>
-              </>
+              <ModelFields key={editor.data.id} config={editor.data} />
             )}
             {editor.kind === "mcp" && (
               <>
+                {editor.data.service_type === "jenkins" ? (
+                  <>
+                    <Alert type="info" showIcon message="填写 Jenkins 连接信息"
+                      description="保存后在对话或工作流中选择此连接，Agent 即可查看任务、触发参数化构建、读取日志、停止构建、启停任务和管理任务配置。操作权限与 Jenkins 账号一致。"
+                      style={{ marginBottom: 20 }} />
+                    <Form.Item name="url" label="Jenkins 地址"
+                      rules={[{ required: true, whitespace: true, message: "请输入 Jenkins 地址或 IP:端口" }]}
+                      extra="支持 http(s)://地址、IP:端口，以及 /jenkins 等访问路径；省略协议时使用 HTTP。">
+                      <Input placeholder="192.168.1.10:8080 或 https://ci.example.com/jenkins" autoComplete="off" />
+                    </Form.Item>
+                    <Form.Item name="username" label="账号" rules={[{ required: true, whitespace: true, message: "请输入 Jenkins 账号" }]}>
+                      <Input autoComplete="off" />
+                    </Form.Item>
+                    <Form.Item name="password" label="密码 / API Token"
+                      rules={editor.data.has_password ? [] : [{ required: true, message: "请输入 Jenkins 密码或 API Token" }]}
+                      extra={editor.data.has_password ? "已保存凭据，留空保持原凭据。" : "填写 Jenkins 登录密码；也支持此账号的 API Token。"}>
+                      <Input.Password autoComplete="new-password" placeholder={editor.data.has_password ? "已保存，留空不修改" : "Jenkins 密码或 API Token"} />
+                    </Form.Item>
+                    <Form.Item name="allowed_tools" label="工具白名单"
+                      extra="默认授权 Jenkins 操作工具，可移除不需要的写操作。空白名单不允许执行任何工具。">
+                      <Select mode="tags" />
+                    </Form.Item>
+                  </>
+                ) : editor.data.service_type === "ssh" ? (
+                  <>
+                    <Alert type="info" showIcon message="填写 SSH 连接信息"
+                      description="保存后在对话中选择此连接，Agent 即可执行远程命令、浏览目录、读取和写入文件，操作权限与登录账号一致。"
+                      style={{ marginBottom: 20 }} />
+                    <Form.Item name="host" label="IP / 主机名" rules={[{ required: true, whitespace: true, message: "请输入服务器 IP 或主机名" }]}>
+                      <Input placeholder="192.168.1.10" autoComplete="off" />
+                    </Form.Item>
+                    <Form.Item name="port" label="SSH 端口" rules={[{ required: true, message: "请输入 SSH 端口" }]}>
+                      <Input type="number" min={1} max={65535} />
+                    </Form.Item>
+                    <Form.Item name="username" label="账号" rules={[{ required: true, whitespace: true, message: "请输入 SSH 账号" }]}>
+                      <Input autoComplete="off" />
+                    </Form.Item>
+                    <Form.Item name="password" label="密码" rules={editor.data.has_password ? [] : [{ required: true, message: "请输入 SSH 密码" }]}
+                      extra={editor.data.has_password ? "已保存密码，留空保持原密码。" : "填写服务器 SSH 登录密码。"}>
+                      <Input.Password autoComplete="new-password" placeholder={editor.data.has_password ? "已保存，留空不修改" : "SSH 登录密码"} />
+                    </Form.Item>
+                  </>
+                ) : editor.data.service_type === "database" ? (
+                  <>
+                    <Alert type="info" showIcon message="填写数据库连接信息"
+                      description="保存后即可使用列出表、查看字段和只读查询工具。数据库地址需要能从 AI 服务器访问。"
+                      style={{ marginBottom: 20 }} />
+                    <Form.Item name="url" label="数据库 URL"
+                      rules={[{ required: true, message: "请输入数据库 URL" }]}
+                      extra="包含主机、端口和数据库名；也支持 主机:端口/数据库名。">
+                      <Input placeholder={editor.data.database_engine === "mysql" ? "mysql://127.0.0.1:3306/my_database" : "postgresql://127.0.0.1:5432/my_database"} />
+                    </Form.Item>
+                    <Form.Item name="username" label="账号" rules={[{ required: true, whitespace: true, message: "请输入数据库账号" }]}>
+                      <Input autoComplete="off" />
+                    </Form.Item>
+                    <Form.Item name="password" label="密码" extra={editor.data.has_password ? "已保存密码，留空保持原密码。" : "填写数据库密码；无密码时可留空。"}>
+                      <Input.Password autoComplete="new-password" placeholder={editor.data.has_password ? "已保存，留空不修改" : "数据库密码"} />
+                    </Form.Item>
+                    {editor.data.has_password && <Form.Item name="clear_password" label="清除已保存密码" valuePropName="checked"><Switch /></Form.Item>}
+                  </>
+                ) : (
+                  <>
                 <Alert
                   type="info"
                   showIcon
                   message="填写 MCP 服务地址"
-                  description="这里连接已部署的远程 MCP 服务。数据库账号和密码配置在该 MCP 服务端；保存并启用连接后，可在聊天右侧选择。"
+                  description="这里连接已部署的远程 MCP 服务。MySQL / PostgreSQL 请使用管理页的数据库连接按钮。保存并启用后可在聊天右侧选择。"
                   style={{ marginBottom: 20 }}
                 />
                 <Form.Item name="transport" label="连接方式">
@@ -1073,6 +1296,8 @@ function Console() {
                 >
                   <Select mode="tags" placeholder="输入工具名称" />
                 </Form.Item>
+                  </>
+                )}
               </>
             )}
             {editor.kind === "skills" && (
@@ -1090,62 +1315,41 @@ function Console() {
                 </Form.Item>
               </>
             )}
-            {editor.kind === "workflows" && (
-              <>
-                <Form.Item name="description" label="简介">
-                  <Input />
-                </Form.Item>
-                <Alert
-                  type="info"
-                  message="模板变量：{{input}}、{{previous}}、{{steps.步骤ID}}"
-                  description="从第一步开始执行。next 为成功后的步骤，条件步骤使用 contains 和 otherwise。没有 next 时结束；禁止循环。"
-                />
-                <Form.Item
-                  name="steps_json"
-                  label="步骤配置（JSON 数组）"
-                  rules={[{ required: true }]}
-                >
-                  <Input.TextArea rows={22} className="code-input" />
-                </Form.Item>
-              </>
-            )}
-            {editor.kind !== "workflows" && (
-              <Form.Item name="enabled" label="启用" valuePropName="checked">
-                <Switch />
-              </Form.Item>
-            )}
+            <Form.Item name="enabled" label="启用" valuePropName="checked">
+              <Switch />
+            </Form.Item>
           </Form>
         )}
       </Drawer>
-      <Modal
-        title={"运行：" + (workflowRun?.name || "")}
-        open={!!workflowRun}
-        onCancel={() => {
-          if (!workflowBusy) setWorkflowRun(null);
-        }}
-        onOk={() => void executeWorkflow()}
-        confirmLoading={workflowBusy}
-        okText="开始执行"
-        cancelButtonProps={{ disabled: workflowBusy }}
-        closable={!workflowBusy}
-        maskClosable={!workflowBusy}
-      >
-        <p>选择默认模型并输入任务。执行期间请保持页面打开。</p>
-        <Select
-          style={{ width: "100%", marginBottom: 16 }}
-          value={model}
-          onChange={setModel}
-          options={models
-            .filter((m) => m.enabled)
-            .map((m) => ({ value: m.id, label: m.name }))}
+      {visualWorkflow && (
+        <WorkflowEditor
+          workflow={visualWorkflow}
+          models={selectableModels}
+          skills={skills}
+          mcps={mcps}
+          onClose={() => setVisualWorkflow(null)}
+          onSaved={() => void refresh()}
         />
-        <Input.TextArea
-          rows={6}
-          value={workflowInput}
-          onChange={(e) => setWorkflowInput(e.target.value)}
-          placeholder="输入流程需要处理的内容"
+      )}
+      {workflowRun && (
+        <WorkflowRunView
+          workflow={workflowRun as Workflow}
+          models={selectableModels}
+          defaultModel={model}
+          onClose={() => setWorkflowRun(null)}
+          onFinished={() => void refresh()}
         />
-      </Modal>
+      )}
+      {runHistory?.workflow_snapshot && (
+        <WorkflowRunView
+          record={runHistory}
+          workflow={runHistory.workflow_snapshot}
+          models={selectableModels}
+          defaultModel={model}
+          onClose={() => setRunHistory(null)}
+          onFinished={() => {}}
+        />
+      )}
       <Drawer
         title={detail?.name || "执行详情"}
         width={720}
